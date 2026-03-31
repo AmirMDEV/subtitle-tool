@@ -70,6 +70,28 @@ class BadLiteralOllama(SuccessfulOllama):
         return {"translations": [""]}
 
 
+class SwitchableLiteralFailureOllama(SuccessfulOllama):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_literal = False
+
+    def generate_json(self, model: str, prompt: str, temperature: float) -> dict[str, list[str]]:
+        if self.fail_literal and '"literal_en"' not in prompt:
+            return {"translations": [""]}
+        return super().generate_json(model, prompt, temperature)
+
+
+class SelectiveLiteralFailureOllama(SuccessfulOllama):
+    def __init__(self, failing_filenames: set[str]) -> None:
+        super().__init__()
+        self.failing_filenames = failing_filenames
+
+    def generate_json(self, model: str, prompt: str, temperature: float) -> dict[str, list[str]]:
+        if '"literal_en"' not in prompt and any(f"filename={name}" in prompt for name in self.failing_filenames):
+            return {"translations": [""]}
+        return super().generate_json(model, prompt, temperature)
+
+
 class RetryableJsonOllama(SuccessfulOllama):
     def __init__(self) -> None:
         super().__init__()
@@ -240,7 +262,7 @@ def test_open_output_folder_prefers_export_dir(monkeypatch: pytest.MonkeyPatch, 
     assert opened == [["explorer", str(output_dir)]]
 
 
-def test_literal_failure_requeues_then_fails_on_second_attempt(
+def test_literal_failure_finishes_as_failed_without_crashing_the_worker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -250,15 +272,7 @@ def test_literal_failure_requeues_then_fails_on_second_attempt(
     source.write_text("video", encoding="utf-8")
     manifest = service.enqueue(source, profile="default")
 
-    with pytest.raises(QueueError):
-        service.run_until_empty()
-
-    job_dir, loaded = service.store.find_job(manifest.job_id)
-    assert job_dir.parent.name == "incoming"
-    assert loaded.checkpoint("translate_literal").attempts == 1
-
-    with pytest.raises(QueueError):
-        service.run_until_empty()
+    service.run_until_empty()
 
     job_dir, loaded = service.store.find_job(manifest.job_id)
     assert job_dir.parent.name == "failed"
@@ -329,3 +343,127 @@ def test_preview_rows_and_rebuild_english_use_saved_notes(
     assert loaded.scene_contexts[0].notes == "Travel talk about family resemblance."
     assert any("Whole video is about appearance comparison and tone." in prompt for _model, prompt in ollama.calls)
     assert any("Travel talk about family resemblance." in prompt for _model, prompt in ollama.calls)
+
+
+def test_update_subtitle_line_updates_local_and_exported_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    patch_runtime(monkeypatch)
+    service = build_service(tmp_path, SuccessfulOllama())
+    source = tmp_path / "edit-line.mp4"
+    source.write_text("video", encoding="utf-8")
+    manifest = service.enqueue(source, profile="default")
+    service.run_until_empty()
+
+    job_dir, loaded = service.store.find_job(manifest.job_id)
+    export_dir = Path(loaded.export_dir)
+
+    service.update_subtitle_line(
+        manifest.job_id,
+        cue_index=1,
+        japanese_text="henshu shimashita",
+        literal_english_text="edited direct line",
+        adapted_english_text="edited easy line",
+    )
+
+    preview = service.preview_rows(manifest.job_id)
+    assert preview[0]["japanese"] == "henshu shimashita"
+    assert preview[0]["literal_english"] == "edited direct line"
+    assert preview[0]["adapted_english"] == "edited easy line"
+    assert "henshu shimashita" in (job_dir / loaded.artifacts["ja_srt"]).read_text(encoding="utf-8")
+    assert "edited direct line" in (job_dir / loaded.artifacts["literal_srt"]).read_text(encoding="utf-8")
+    assert "edited easy line" in (job_dir / loaded.artifacts["adapted_srt"]).read_text(encoding="utf-8")
+    assert "henshu shimashita" in (export_dir / loaded.artifacts["ja_srt"]).read_text(encoding="utf-8")
+    assert "edited direct line" in (export_dir / loaded.artifacts["literal_srt"]).read_text(encoding="utf-8")
+    assert "edited easy line" in (export_dir / loaded.artifacts["adapted_srt"]).read_text(encoding="utf-8")
+
+
+def test_update_subtitle_line_rejects_empty_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    patch_runtime(monkeypatch)
+    service = build_service(tmp_path, SuccessfulOllama())
+    source = tmp_path / "edit-empty.mp4"
+    source.write_text("video", encoding="utf-8")
+    manifest = service.enqueue(source, profile="default")
+    service.run_until_empty()
+
+    with pytest.raises(QueueError, match="Direct English text cannot be empty."):
+        service.update_subtitle_line(
+            manifest.job_id,
+            cue_index=1,
+            literal_english_text="   ",
+        )
+
+
+def test_worker_continues_to_later_jobs_after_one_job_exhausts_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    patch_runtime(monkeypatch)
+    service = build_service(tmp_path, SelectiveLiteralFailureOllama({"bad-batch"}))
+    bad_source = tmp_path / "bad-batch.mp4"
+    good_source = tmp_path / "good-batch.mp4"
+    bad_source.write_text("video", encoding="utf-8")
+    good_source.write_text("video", encoding="utf-8")
+    bad_manifest = service.enqueue(bad_source, profile="default")
+    good_manifest = service.enqueue(good_source, profile="default")
+
+    service.run_until_empty()
+
+    bad_job_dir, bad_loaded = service.store.find_job(bad_manifest.job_id)
+    good_job_dir, good_loaded = service.store.find_job(good_manifest.job_id)
+    assert bad_job_dir.parent.name == "failed"
+    assert bad_loaded.checkpoint("translate_literal").attempts == 2
+    assert good_job_dir.parent.name == "done"
+    assert (Path(good_loaded.export_dir) / good_loaded.artifacts["adapted_srt"]).exists()
+
+
+def test_invalid_profile_name_fails_at_enqueue_time(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    patch_runtime(monkeypatch)
+    service = build_service(tmp_path, SuccessfulOllama())
+    source = tmp_path / "profile-check.mp4"
+    source.write_text("video", encoding="utf-8")
+
+    with pytest.raises(QueueError, match="Unknown profile 'turbo'"):
+        service.enqueue(source, profile="turbo")
+
+
+def test_rebuild_english_failure_keeps_previous_english_outputs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    patch_runtime(monkeypatch)
+    ollama = SwitchableLiteralFailureOllama()
+    service = build_service(tmp_path, ollama)
+    source = tmp_path / "rebuild-keep.mp4"
+    source.write_text("video", encoding="utf-8")
+    manifest = service.enqueue(source, profile="default")
+    service.run_until_empty()
+
+    job_dir, loaded = service.store.find_job(manifest.job_id)
+    export_dir = Path(loaded.export_dir)
+    original_literal_local = (job_dir / loaded.artifacts["literal_srt"]).read_text(encoding="utf-8")
+    original_adapted_local = (job_dir / loaded.artifacts["adapted_srt"]).read_text(encoding="utf-8")
+    original_literal_export = (export_dir / loaded.artifacts["literal_srt"]).read_text(encoding="utf-8")
+    original_adapted_export = (export_dir / loaded.artifacts["adapted_srt"]).read_text(encoding="utf-8")
+
+    ollama.fail_literal = True
+
+    with pytest.raises(QueueError):
+        service.rebuild_english(
+            manifest.job_id,
+            batch_label="Batch B",
+            overall_context="Updated context that should not replace good files on failure.",
+            scene_contexts=[],
+        )
+
+    assert (job_dir / loaded.artifacts["literal_srt"]).read_text(encoding="utf-8") == original_literal_local
+    assert (job_dir / loaded.artifacts["adapted_srt"]).read_text(encoding="utf-8") == original_adapted_local
+    assert (export_dir / loaded.artifacts["literal_srt"]).read_text(encoding="utf-8") == original_literal_export
+    assert (export_dir / loaded.artifacts["adapted_srt"]).read_text(encoding="utf-8") == original_adapted_export

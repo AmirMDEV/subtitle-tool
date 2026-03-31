@@ -62,6 +62,23 @@ def test_resume_failed_job_moves_back_to_incoming(tmp_path: Path) -> None:
     assert resumed_manifest.status == "queued"
 
 
+def test_resume_working_job_moves_back_to_incoming(tmp_path: Path) -> None:
+    config = build_config(tmp_path)
+    store = QueueStore(config)
+    source = tmp_path / "resume-working.mp4"
+    source.write_text("video", encoding="utf-8")
+    manifest = store.enqueue(source, profile="default")
+
+    working_dir, manifest = store.claim_next_job()
+    assert working_dir is not None
+    assert working_dir.parent.name == "working"
+
+    resumed_dir, resumed_manifest = store.resume_job(manifest.job_id)
+
+    assert resumed_dir.parent.name == "incoming"
+    assert resumed_manifest.status == "queued"
+
+
 def test_enqueue_uses_unique_job_ids_for_same_stem(tmp_path: Path) -> None:
     config = build_config(tmp_path)
     store = QueueStore(config)

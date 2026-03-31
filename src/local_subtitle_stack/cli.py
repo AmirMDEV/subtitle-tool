@@ -25,6 +25,9 @@ def build_parser() -> argparse.ArgumentParser:
     resume = subparsers.add_parser("resume", help="Resume a queued or failed job.")
     resume.add_argument("job_id")
 
+    rebuild = subparsers.add_parser("rebuild-english", help="Rebuild English subtitle outputs for one job.")
+    rebuild.add_argument("job_id")
+
     review = subparsers.add_parser("open-review", help="Open completed subtitle outputs in Subtitle Edit.")
     review.add_argument("job_id", nargs="?")
 
@@ -91,6 +94,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "resume":
             manifest = service.resume(args.job_id)
             print(f"Resumed {manifest.job_id}")
+            return 0
+
+        if args.command == "rebuild-english":
+            manifest = service.rebuild_english_from_saved_notes(args.job_id)
+            print(f"Rebuilt English for {manifest.job_id}")
             return 0
 
         if args.command == "open-review":

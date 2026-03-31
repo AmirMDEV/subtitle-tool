@@ -81,6 +81,9 @@ class AppConfig:
 
     def profile(self, name: str | None = None) -> ProfileConfig:
         selected = name or self.default_profile
+        if selected not in self.profiles:
+            available = ", ".join(sorted(self.profiles))
+            raise ValueError(f"Unknown profile '{selected}'. Available profiles: {available}")
         return self.profiles[selected]
 
     def to_dict(self) -> dict[str, Any]:

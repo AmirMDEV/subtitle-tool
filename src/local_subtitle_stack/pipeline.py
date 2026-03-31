@@ -17,6 +17,8 @@ REFUSAL_MARKERS = (
     "with that request",
     "cannot provide that",
     "can't provide that",
+    "cannot comply with that",
+    "can't comply with that",
 )
 
 
@@ -297,9 +299,13 @@ def looks_like_refusal_boilerplate(text: str) -> bool:
     lowered = text.lower().strip()
     if "policy" in lowered:
         return True
-    if "request" not in lowered and "provide that" not in lowered:
+    if re.search(r"\b(can(?:not|'t))\s+help it\b", lowered):
         return False
-    return (
-        any(marker in lowered for marker in REFUSAL_MARKERS)
-        and ("assist" in lowered or "provide" in lowered or "comply" in lowered)
+    if any(marker in lowered for marker in REFUSAL_MARKERS):
+        return True
+    refusal_patterns = (
+        r"\b(?:cannot|can't|unable to)\s+(?:assist|comply|provide)\b",
+        r"\b(?:cannot|can't)\s+help with that\b",
+        r"\b(?:cannot|can't)\s+do that\b",
     )
+    return any(re.search(pattern, lowered) for pattern in refusal_patterns)

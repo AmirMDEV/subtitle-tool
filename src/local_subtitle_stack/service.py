@@ -78,6 +78,7 @@ class WorkerService:
         context: str | None = None,
         scene_contexts: list[SceneContextBlock] | None = None,
     ) -> JobManifest:
+        self._require_profile(profile)
         return self.store.enqueue(
             source_path=source,
             profile=profile,
@@ -96,6 +97,7 @@ class WorkerService:
         context: str | None = None,
         scene_contexts: list[SceneContextBlock] | None = None,
     ) -> tuple[list[JobManifest], list[Path]]:
+        self._require_profile(profile)
         manifests: list[JobManifest] = []
         skipped: list[Path] = []
         existing = {
@@ -137,6 +139,7 @@ class WorkerService:
             raise QueueError(f"Folder not found: {folder}")
         if not folder.is_dir():
             raise QueueError(f"Folder path is not a directory: {folder}")
+        self._require_profile(profile)
         return self.enqueue_many(
             list_video_sources(folder, recursive=recursive),
             profile=profile,
@@ -186,9 +189,54 @@ class WorkerService:
                     "japanese": ja_by_index.get(cue_index).text if cue_index in ja_by_index else "",
                     "literal_english": literal_by_index.get(cue_index).text if cue_index in literal_by_index else "",
                     "adapted_english": adapted_by_index.get(cue_index).text if cue_index in adapted_by_index else "",
+                    "has_japanese": cue_index in ja_by_index,
+                    "has_literal_english": cue_index in literal_by_index,
+                    "has_adapted_english": cue_index in adapted_by_index,
                 }
             )
         return rows
+
+    def update_subtitle_line(
+        self,
+        job_id: str,
+        *,
+        cue_index: int,
+        japanese_text: str | None = None,
+        literal_english_text: str | None = None,
+        adapted_english_text: str | None = None,
+    ) -> JobManifest:
+        job_dir, manifest = self.store.find_job(job_id)
+        updates = (
+            ("ja_cues", "ja_srt", japanese_text, "Japanese"),
+            ("literal_cues", "literal_srt", literal_english_text, "Direct English"),
+            ("adapted_cues", "adapted_srt", adapted_english_text, "Easy English"),
+        )
+        updated_any = False
+        for cues_artifact, srt_artifact, text, label in updates:
+            if text is None:
+                continue
+            normalized = text.strip()
+            if not normalized:
+                raise QueueError(f"{label} text cannot be empty.")
+            cues_path = job_dir / manifest.artifacts[cues_artifact]
+            if not cues_path.exists():
+                raise QueueError(f"{label} subtitle lines are not ready yet for this job.")
+            cues = load_cues(cues_path)
+            match = next((cue for cue in cues if cue.index == cue_index), None)
+            if match is None:
+                raise QueueError(f"Could not find subtitle line {cue_index} in {label}.")
+            match.text = normalized
+            save_cues(cues_path, cues)
+            local_srt_path = job_dir / manifest.artifacts[srt_artifact]
+            write_srt(local_srt_path, cues)
+            export_dir = self._output_dir_for_manifest(manifest)
+            self._export_text_artifact(local_srt_path, export_dir / manifest.artifacts[srt_artifact])
+            updated_any = True
+
+        if not updated_any:
+            raise QueueError("No subtitle text changes were provided.")
+        self._save_manifest(job_dir, manifest)
+        return manifest
 
     def save_job_notes(
         self,
@@ -217,37 +265,36 @@ class WorkerService:
         if not (job_dir / manifest.artifacts["ja_cues"]).exists():
             raise QueueError("Japanese subtitle lines are not ready yet. Start processing first.")
 
+        self._require_profile(manifest.profile)
         manifest.series = batch_label or None
         manifest.job_context = overall_context or None
         manifest.scene_contexts = list(scene_contexts)
-        manifest.review_flags = [
-            flag for flag in manifest.review_flags if flag.stage not in {STAGE_LITERAL, STAGE_ADAPTED}
-        ]
-        for stage_name in (STAGE_LITERAL, STAGE_ADAPTED, STAGE_FINALIZE):
-            checkpoint = manifest.checkpoint(stage_name)
-            checkpoint.status = "pending"
-            checkpoint.attempts = 0
-            checkpoint.details = {}
-
-        self._clear_translation_outputs(job_dir, manifest)
         self._save_manifest(job_dir, manifest)
-
-        profile = self.config.profile(manifest.profile)
-        ensure_safe_to_start_job(profile.min_free_ram_translation_mb, profile.max_rss_mb)
-        self._stage_translate_literal(job_dir, manifest)
-        self._stage_translate_adapted(job_dir, manifest)
-        self._stage_finalize(job_dir, manifest)
-        self._save_manifest(job_dir, manifest)
+        self._rebuild_english_transactional(job_dir, manifest)
         return manifest
+
+    def rebuild_english_from_saved_notes(self, job_id: str) -> JobManifest:
+        with self.store.acquire_worker_lock():
+            job_dir, manifest = self.store.find_job(job_id)
+            if not (job_dir / manifest.artifacts["ja_cues"]).exists():
+                raise QueueError("Japanese subtitle lines are not ready yet. Start processing first.")
+            self._require_profile(manifest.profile)
+            self._rebuild_english_transactional(job_dir, manifest)
+            return manifest
 
     def run_until_empty(self) -> None:
         with self.store.acquire_worker_lock():
             while True:
+                if self.store.pause_requested():
+                    return
                 claimed = self.store.claim_next_job()
                 if not claimed:
                     return
                 job_dir, manifest = claimed
-                self._run_job(job_dir, manifest)
+                try:
+                    self._run_job(job_dir, manifest)
+                except QueueError:
+                    continue
 
     def resume(self, job_id: str) -> JobManifest:
         _job_dir, manifest = self.store.resume_job(job_id)
@@ -269,7 +316,7 @@ class WorkerService:
         return target
 
     def _run_job(self, job_dir: Path, manifest: JobManifest) -> None:
-        profile = self.config.profile(manifest.profile)
+        profile = self._require_profile(manifest.profile)
         try:
             ensure_safe_to_start_job(
                 self._job_start_min_free_ram(manifest, profile),
@@ -283,8 +330,6 @@ class WorkerService:
             self.store.mark_completed(job_dir, manifest)
         except PauseRequested:
             return
-        except QueueError:
-            raise
         except Exception as exc:
             self._handle_stage_failure(job_dir, manifest, exc)
 
@@ -292,6 +337,12 @@ class WorkerService:
         if manifest.checkpoint(STAGE_TRANSCRIBE).status == "completed":
             return profile.min_free_ram_translation_mb
         return profile.min_free_ram_mb
+
+    def _require_profile(self, profile_name: str):
+        try:
+            return self.config.profile(profile_name)
+        except ValueError as exc:
+            raise QueueError(str(exc)) from exc
 
     def _should_pause(self, job_dir: Path, manifest: JobManifest) -> None:
         if self.store.pause_requested():
@@ -407,6 +458,11 @@ class WorkerService:
         output_srt_artifact: str,
         group_size: int,
         adapted: bool,
+        ja_cues_path: Path | None = None,
+        literal_input_path: Path | None = None,
+        output_cues_path: Path | None = None,
+        output_srt_path: Path | None = None,
+        partial_path: Path | None = None,
     ) -> None:
         checkpoint = manifest.checkpoint(stage_name)
         if checkpoint.status == "completed":
@@ -418,13 +474,18 @@ class WorkerService:
         profile = self.config.profile(manifest.profile)
         ensure_safe_to_start_job(profile.min_free_ram_translation_mb, profile.max_rss_mb)
 
-        ja_cues = load_cues(job_dir / manifest.artifacts["ja_cues"])
-        literal_cues = load_cues(job_dir / manifest.artifacts["literal_cues"]) if adapted else []
+        ja_source_path = ja_cues_path or (job_dir / manifest.artifacts["ja_cues"])
+        literal_source_path = literal_input_path or (job_dir / manifest.artifacts["literal_cues"])
+        final_cues_path = output_cues_path or (job_dir / manifest.artifacts[output_artifact])
+        final_srt_path = output_srt_path or (job_dir / manifest.artifacts[output_srt_artifact])
+        partial_output_path = partial_path or (job_dir / f"{output_artifact}.partial.json")
+
+        ja_cues = load_cues(ja_source_path)
+        literal_cues = load_cues(literal_source_path) if adapted else []
         glossary = load_glossary(manifest.glossary_path)
         metadata = metadata_from_manifest(manifest.source_name, manifest.series)
         groups = cue_groups(ja_cues, group_size)
-        partial_path = job_dir / f"{output_artifact}.partial.json"
-        partial_rows = read_json(partial_path, default=[]) or []
+        partial_rows = read_json(partial_output_path, default=[]) or []
         translated_cues = [Cue.from_dict(item) for item in partial_rows]
         start_group = int(checkpoint.details.get("completed_groups", 0))
 
@@ -485,7 +546,7 @@ class WorkerService:
 
             checkpoint.details["completed_groups"] = group_index + 1
             atomic_write_json(
-                partial_path,
+                partial_output_path,
                 [
                     {"index": cue.index, "start": cue.start, "end": cue.end, "text": cue.text}
                     for cue in translated_cues
@@ -493,14 +554,21 @@ class WorkerService:
             )
             self._save_manifest(job_dir, manifest)
 
-        final_path = job_dir / manifest.artifacts[output_artifact]
-        save_cues(final_path, translated_cues)
-        write_srt(job_dir / manifest.artifacts[output_srt_artifact], translated_cues)
+        save_cues(final_cues_path, translated_cues)
+        write_srt(final_srt_path, translated_cues)
         checkpoint.status = "completed"
         self._save_manifest(job_dir, manifest)
-        partial_path.unlink(missing_ok=True)
+        partial_output_path.unlink(missing_ok=True)
 
-    def _stage_translate_literal(self, job_dir: Path, manifest: JobManifest) -> None:
+    def _stage_translate_literal(
+        self,
+        job_dir: Path,
+        manifest: JobManifest,
+        *,
+        output_cues_path: Path | None = None,
+        output_srt_path: Path | None = None,
+        partial_path: Path | None = None,
+    ) -> None:
         self._translate_stage(
             job_dir=job_dir,
             manifest=manifest,
@@ -510,9 +578,21 @@ class WorkerService:
             output_srt_artifact="literal_srt",
             group_size=self.config.profile(manifest.profile).translation_group_size,
             adapted=False,
+            output_cues_path=output_cues_path,
+            output_srt_path=output_srt_path,
+            partial_path=partial_path,
         )
 
-    def _stage_translate_adapted(self, job_dir: Path, manifest: JobManifest) -> None:
+    def _stage_translate_adapted(
+        self,
+        job_dir: Path,
+        manifest: JobManifest,
+        *,
+        literal_input_path: Path | None = None,
+        output_cues_path: Path | None = None,
+        output_srt_path: Path | None = None,
+        partial_path: Path | None = None,
+    ) -> None:
         self._translate_stage(
             job_dir=job_dir,
             manifest=manifest,
@@ -522,6 +602,10 @@ class WorkerService:
             output_srt_artifact="adapted_srt",
             group_size=self.config.profile(manifest.profile).adapted_group_size,
             adapted=True,
+            literal_input_path=literal_input_path,
+            output_cues_path=output_cues_path,
+            output_srt_path=output_srt_path,
+            partial_path=partial_path,
         )
 
     def _stage_finalize(self, job_dir: Path, manifest: JobManifest) -> None:
@@ -595,6 +679,106 @@ class WorkerService:
 
     def _export_text_artifact(self, source_path: Path, target_path: Path) -> None:
         atomic_write_text(target_path, source_path.read_text(encoding="utf-8"))
+
+    def _rebuild_english_transactional(self, job_dir: Path, manifest: JobManifest) -> None:
+        profile = self._require_profile(manifest.profile)
+        ensure_safe_to_start_job(profile.min_free_ram_translation_mb, profile.max_rss_mb)
+
+        temp_paths = self._rebuild_temp_paths(job_dir, manifest)
+        original_manifest = JobManifest.from_dict(manifest.to_dict())
+        working_manifest = JobManifest.from_dict(manifest.to_dict())
+        working_manifest.error = None
+        working_manifest.review_flags = [
+            flag for flag in working_manifest.review_flags if flag.stage not in {STAGE_LITERAL, STAGE_ADAPTED}
+        ]
+        for stage_name in (STAGE_LITERAL, STAGE_ADAPTED, STAGE_FINALIZE):
+            checkpoint = working_manifest.checkpoint(stage_name)
+            checkpoint.status = "pending"
+            checkpoint.attempts = 0
+            checkpoint.details = {}
+
+        self._cleanup_paths(temp_paths.values())
+        try:
+            self._save_manifest(job_dir, working_manifest)
+            self._stage_translate_literal(
+                job_dir,
+                working_manifest,
+                output_cues_path=temp_paths["literal_cues"],
+                output_srt_path=temp_paths["literal_srt"],
+                partial_path=temp_paths["literal_partial"],
+            )
+            self._stage_translate_adapted(
+                job_dir,
+                working_manifest,
+                literal_input_path=temp_paths["literal_cues"],
+                output_cues_path=temp_paths["adapted_cues"],
+                output_srt_path=temp_paths["adapted_srt"],
+                partial_path=temp_paths["adapted_partial"],
+            )
+
+            working_manifest.current_stage = STAGE_FINALIZE
+            finalize_checkpoint = working_manifest.checkpoint(STAGE_FINALIZE)
+            finalize_checkpoint.attempts += 1
+            self._write_review_file(temp_paths["review"], working_manifest.review_flags)
+            self._save_manifest(job_dir, working_manifest)
+
+            self._promote_rebuild_outputs(job_dir, manifest, temp_paths)
+            manifest.review_flags = list(working_manifest.review_flags)
+            manifest.error = None
+            manifest.current_stage = STAGE_FINALIZE
+            for stage_name in (STAGE_LITERAL, STAGE_ADAPTED, STAGE_FINALIZE):
+                manifest.checkpoints[stage_name] = working_manifest.checkpoint(stage_name)
+            output_dir = self._export_final_outputs(job_dir, manifest)
+            finalize_checkpoint = manifest.checkpoint(STAGE_FINALIZE)
+            finalize_checkpoint.status = "completed"
+            finalize_checkpoint.details = {"export_dir": str(output_dir)}
+            self._save_manifest(job_dir, manifest)
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            original_manifest.error = detail
+            self._save_manifest(job_dir, original_manifest)
+            raise QueueError(detail) from exc
+        finally:
+            self._cleanup_paths(temp_paths.values())
+
+    def _rebuild_temp_paths(self, job_dir: Path, manifest: JobManifest) -> dict[str, Path]:
+        literal_cues = job_dir / manifest.artifacts["literal_cues"]
+        adapted_cues = job_dir / manifest.artifacts["adapted_cues"]
+        literal_srt = job_dir / manifest.artifacts["literal_srt"]
+        adapted_srt = job_dir / manifest.artifacts["adapted_srt"]
+        review = job_dir / manifest.artifacts["review"]
+        return {
+            "literal_cues": literal_cues.with_name(f"{literal_cues.stem}.rebuild{literal_cues.suffix}"),
+            "adapted_cues": adapted_cues.with_name(f"{adapted_cues.stem}.rebuild{adapted_cues.suffix}"),
+            "literal_srt": literal_srt.with_name(f"{literal_srt.stem}.rebuild{literal_srt.suffix}"),
+            "adapted_srt": adapted_srt.with_name(f"{adapted_srt.stem}.rebuild{adapted_srt.suffix}"),
+            "review": review.with_name(f"{review.stem}.rebuild{review.suffix}"),
+            "literal_partial": job_dir / "literal_cues.rebuild.partial.json",
+            "adapted_partial": job_dir / "adapted_cues.rebuild.partial.json",
+        }
+
+    def _write_review_file(self, path: Path, review_flags: list[ReviewFlag]) -> None:
+        write_review_flags(
+            path,
+            [
+                {
+                    "stage": flag.stage,
+                    "group_index": flag.group_index,
+                    "reason": flag.reason,
+                    "detail": flag.detail,
+                    "created_at": flag.created_at,
+                }
+                for flag in review_flags
+            ],
+        )
+
+    def _promote_rebuild_outputs(self, job_dir: Path, manifest: JobManifest, temp_paths: dict[str, Path]) -> None:
+        for artifact_key in ("literal_cues", "adapted_cues", "literal_srt", "adapted_srt", "review"):
+            self._export_text_artifact(temp_paths[artifact_key], job_dir / manifest.artifacts[artifact_key])
+
+    def _cleanup_paths(self, paths) -> None:
+        for path in paths:
+            Path(path).unlink(missing_ok=True)
 
     def _export_final_outputs(self, job_dir: Path, manifest: JobManifest) -> Path:
         output_dir = self._output_dir_for_manifest(manifest)

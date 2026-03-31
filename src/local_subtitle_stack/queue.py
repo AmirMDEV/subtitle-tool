@@ -217,7 +217,7 @@ class QueueStore:
             raise QueueError("Completed jobs cannot be resumed. Queue the source again to rerun it.")
         manifest.status = JOB_STATUS_QUEUED
         manifest.error = None
-        if job_dir.parent == self.failed_dir:
+        if job_dir.parent in {self.failed_dir, self.working_dir}:
             target = self.incoming_dir / job_dir.name
             shutil.move(str(job_dir), str(target))
             job_dir = target
