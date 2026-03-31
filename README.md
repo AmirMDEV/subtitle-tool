@@ -46,7 +46,7 @@ They are saved in a folder named like this:
 
 ## Fastest Way To Use It
 
-1. Download the newest release files from the [Releases](https://github.com/AmirMDEV/subtitle-tool/releases) page.
+1. Download the newest release files from the [Releases](https://github.com/AmirMDEV/local-japanese-to-english-subtitles-asr-llm/releases) page.
 2. Put every `.zip` file from that release into the same folder.
 3. Unzip them all into the same place, like `C:\SubtitleTool`.
 4. If Windows asks whether to merge folders, say `Yes`.

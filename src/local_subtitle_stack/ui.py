@@ -371,7 +371,7 @@ class ImportExistingDialog(tk.Toplevel):
 class SubtitleStackApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Japanese to English Subtitle Tool")
+        self.title("Local Japanese to English subtitles (ASR + LLM)")
         self.geometry("1480x920")
         self.minsize(1100, 680)
         self.service = build_service()
