@@ -1,0 +1,8 @@
+- jp: ありがとう
+  literal_en: thank you
+  preferred_en: thank you
+  notes: Keep the plain polite meaning unless nearby lines clearly change it.
+- jp: 先輩
+  literal_en: senpai
+  preferred_en: senpai
+  notes: Keep the honorific when the translation should retain Japanese address terms.

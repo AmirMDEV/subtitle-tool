@@ -1,0 +1,10 @@
+.venv311/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+build/
+dist/
+*.egg-info/
+fixtures/output/
